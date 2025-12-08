@@ -8,6 +8,11 @@ import urllib.parse
 from urllib.parse import urlparse
 import requests
 import socket
+import openai
+import torch
+from diffusers import AutoPipelineForText2Image
+from typing import Optional
+from PIL import Image
 
 # ==================== 1. 从环境变量加载设置 ====================
 load_dotenv() 
@@ -29,6 +34,76 @@ llm = ChatOpenAI(
     temperature=0.7,
 )
 
+# 选择适合CPU的模型，并在内存不足时进行优化
+IMAGE_MODEL_ID = "stabilityai/sd-turbo"  # 比SDXL-Turbo更轻量的模型
+
+# 动态加载图像生成管道，根据容器性能选择配置
+try:
+    # 尝试加载fp16精度的模型以节省内存，如果失败则降级为fp32
+    try:
+        image_pipe = AutoPipelineForText2Image.from_pretrained(
+            IMAGE_MODEL_ID,
+            torch_dtype=torch.float16,
+            safety_checker=None,  # 禁用安全检查器以加速并减少内存占用
+            use_safetensors=True
+        )
+    except (RuntimeError, OSError):
+        # 如果fp16失败，可能是内存不足或设备不支持，回退到fp32
+        print("fp16加载失败，尝试使用fp32精度加载模型...")
+        image_pipe = AutoPipelineForText2Image.from_pretrained(
+            IMAGE_MODEL_ID,
+            torch_dtype=torch.float32,
+            safety_checker=None,
+            use_safetensors=True
+        )
+    
+    # 将模型移至CPU（Hugging Face Space免费容器为CPU环境）
+    image_pipe = image_pipe.to("cpu")
+    
+    # 启用CPU优化，大幅减少内存使用并加速推理[citation:7][citation:8]
+    image_pipe.enable_attention_slicing()  # 注意力切片，降低峰值内存
+    if hasattr(image_pipe, "enable_cpu_offload"):
+        image_pipe.enable_cpu_offload()  # 如果管道支持CPU卸载，则启用
+    
+    print("✅ 图像生成模型加载成功 (运行在CPU模式)")
+    
+except Exception as e:
+    print(f"❌ 图像生成模型加载失败: {e}")
+    image_pipe = None
+
+# 定义图像生成函数
+def generate_image_from_prompt(prompt: str) -> Optional[Image.Image]:
+    """
+    使用加载的模型根据提示词生成图像。
+    返回PIL Image对象，如果生成失败则返回None。
+    """
+    if image_pipe is None:
+        print("图像生成模型未加载，无法生成图片。")
+        return None
+    
+    try:
+        print(f"正在生成图像，提示词: {prompt[:50]}...")
+        
+        # **关键参数调整**：为适应CPU环境，大幅减少生成步数以控制时间[citation:7]
+        # 标准SD-Turbo只需1-4步即可生成不错的效果
+        image = image_pipe(
+            prompt=prompt,
+            num_inference_steps=4,        # 步数：在CPU上建议1-4步
+            guidance_scale=1.0,           # 引导系数：SD-Turbo建议1.0（无分类器引导）
+            width=512,                    # 宽度：降低分辨率以大幅减少内存和计算量
+            height=512,                   # 高度
+            generator=torch.Generator(device="cpu").manual_seed(42)  # 固定种子使结果可复现
+        ).images[0]
+        
+        print("✅ 图像生成成功")
+        return image
+        
+    except torch.cuda.OutOfMemoryError:
+        print("❌ 内存溢出 (OOM)，即使是CPU环境也需注意内存限制。")
+        return None
+    except Exception as e:
+        print(f"❌ 图像生成过程出错: {e}")
+        return None
 
 def network_test():
     """测试Space容器的网络连接"""
@@ -153,41 +228,75 @@ review_prompt = ChatPromptTemplate.from_template(
 # 创建可运行链：prompt -> llm
 chain_review = review_prompt | llm
 
-# ==================== 3. 将智能体串联成协同工作流 ====================
-# 定义完整的处理流水线
-overall_chain = RunnableSequence(
-    # 第一步：接收初始输入，传递给拆解链
-    RunnablePassthrough.assign(decomposed_text=lambda x: chain_decompose.invoke(x)),
-    # 第二步：使用上一步的输出去优化
-    lambda x: {"optimized_prompt": chain_optimize.invoke(x["decomposed_text"])},
-    # 第三步：使用优化后的输出去审查/风格化
-    lambda x: {"final_prompt": chain_review.invoke(x["optimized_prompt"])}
-)
+# ==================== 3. 重构：清晰、分步的协同工作流 ====================
 
-# ==================== 4. 定义Gradio界面交互函数 ====================
+def run_agent_chain(user_input: str):
+    """
+    分步执行智能体链，每一步都明确处理输入输出，易于调试。
+    返回: (decomposed_text, optimized_prompt, final_prompt)
+    """
+    print(f"[STEP 0] 开始处理用户输入: {user_input}")
+    
+    # 第一步：拆解
+    try:
+        print(f"[STEP 1] 调用 chain_decompose...")
+        # 明确构造输入字典
+        step1_result = chain_decompose.invoke({"user_input": user_input})
+        decomposed_text = step1_result.content
+        print(f"[STEP 1] 成功。结果: {decomposed_text[:50]}...")  # 打印前50字符
+    except Exception as e:
+        print(f"[STEP 1] 失败: {e}")
+        decomposed_text = f"拆解失败: {e}"
+        return decomposed_text, "", ""  # 提前返回，因为后续步骤依赖此结果
+    
+    # 第二步：优化
+    try:
+        print(f"[STEP 2] 调用 chain_optimize...")
+        # 明确使用上一步的结果作为输入
+        step2_result = chain_optimize.invoke({"decomposed": decomposed_text})
+        optimized_prompt = step2_result.content
+        print(f"[STEP 2] 成功。结果: {optimized_prompt[:50]}...")
+    except Exception as e:
+        print(f"[STEP 2] 失败: {e}")
+        optimized_prompt = f"优化失败: {e}"
+        return decomposed_text, optimized_prompt, ""
+    
+    # 第三步：风格化
+    try:
+        print(f"[STEP 3] 调用 chain_review...")
+        # 明确使用上一步的结果作为输入
+        step3_result = chain_review.invoke({"prompt": optimized_prompt})
+        final_prompt = step3_result.content
+        print(f"[STEP 3] 成功。结果: {final_prompt[:100]}...")
+    except Exception as e:
+        print(f"[STEP 3] 失败: {e}")
+        final_prompt = f"风格化失败: {e}"
+    
+    return decomposed_text, optimized_prompt, final_prompt
+
+# ==================== 4. 更新Gradio界面交互函数 ====================
 def generate_poster(user_input):
     """ 处理用户输入，运行智能体链，并返回结果 """
-    try:
-        # 1. 运行整个协同链
-        # 现在 overall_chain 是一个 RunnableSequence，可直接调用
-        result = overall_chain.invoke({"user_input": user_input})
-
-        # 2. 从结果字典中安全地提取每个环节的文本内容
-        # 注意：chain.invoke() 返回的是 AIMessage 对象，需要用 .content 获取文本
-        decomposed_text = result.get("decomposed_text", "").content if hasattr(result.get("decomposed_text"), 'content') else str(result.get("decomposed_text", ""))
-        optimized_prompt = result.get("optimized_prompt", "").content if hasattr(result.get("optimized_prompt"), 'content') else str(result.get("optimized_prompt", ""))
-        final_prompt = result.get("final_prompt", "").content if hasattr(result.get("final_prompt"), 'content') else str(result.get("final_prompt", ""))
-
-        # 3. （后续）此处应调用图像生成API，用 final_prompt 生成图片
-        image_output = None
-
-        # 4. 返回给Gradio显示
-        return decomposed_text, optimized_prompt, final_prompt, image_output
-
-    except Exception as e:
-        # 异常处理：将错误信息返回给界面，方便调试
-        error_msg = f"处理过程中出现错误：{str(e)}"
-        return error_msg, error_msg, error_msg, None
+    # 调用我们上面定义的分步函数
+    decomposed_text, optimized_prompt, final_prompt_full = run_agent_chain(user_input)
+    
+    # 拆分最终提示词
+    if "---" in final_prompt_full:
+        type_part, final_prompt_part = final_prompt_full.split("---", 1)
+        final_image_prompt = final_prompt_part.strip()
+    else:
+        type_part, final_prompt_part = "类型判断未明确", final_prompt_full
+        final_image_prompt = final_prompt_part.strip()
+    
+    # 图像部分暂时为空
+    generated_image = None
+    if final_image_prompt and not final_image_prompt.startswith("风格化失败"):
+        # 仅当成功获得提示词时才尝试生成图像
+        generated_image = generate_image_from_prompt(final_image_prompt)
+    
+    # 返回给Gradio显示
+    # 注意：这里返回的是 decomposed_text, optimized_prompt, final_prompt_full
+    return decomposed_text, optimized_prompt, final_prompt_full, image_output
 
 # ==================== 5. 构建并启动Gradio Web界面 ====================
 with gr.Blocks(title="SynthPoster") as demo:
@@ -217,8 +326,6 @@ with gr.Blocks(title="SynthPoster") as demo:
         inputs=[user_input],
         outputs=[output_decomposed, output_optimized, output_final, output_image]
     )
-
-    gr.Markdown("### 💡 说明：当前使用占位图片。集成图像API后，即可生成真实图像。")
     
     # 添加测试部分
     gr.Markdown("## 网络诊断工具")
@@ -247,9 +354,6 @@ with gr.Blocks(title="SynthPoster") as demo:
     MODEL_NAME: {LLM_MODEL_NAME}
     """
             try:
-                # 确保在函数内可访问 openai 模块
-                import openai
-                
                 # 1. 初始化openai客户端
                 client = openai.OpenAI(
                     api_key=LLM_API_KEY,
