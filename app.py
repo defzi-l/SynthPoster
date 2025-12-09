@@ -143,57 +143,6 @@ def generate_image_from_prompt(prompt: str) -> Optional[Image.Image]:
         traceback.print_exc()
         return None
 
-def network_test():
-    """测试Space容器的网络连接"""
-    results = []
-    
-    # 测试1：测试Vercel代理
-    try:
-        proxy_url = LLM_BASE_URL
-        response = requests.post(
-            proxy_url,
-            json={"model": "qwen-max", "messages": [{"role": "user", "content": "test"}]},
-            timeout=10
-        )
-        results.append(f"✅ 代理连接成功: 状态码 {response.status_code}")
-    except Exception as e:
-        results.append(f"❌ 代理连接失败: {str(e)}")
-    
-    # 测试2：测试DNS解析
-    if LLM_BASE_URL:
-        try:
-            # 使用urlparse提取域名
-            parsed_url = urlparse(LLM_BASE_URL)
-            domain = parsed_url.netloc  # 这将得到类似 "qwen-proxy-psi.vercel.app"
-            
-            # 如果URL中包含端口号，需要去掉端口部分
-            if ':' in domain:
-                domain = domain.split(':')[0]
-                
-            ip = socket.gethostbyname(domain)
-            results.append(f"✅ DNS解析成功: {domain} → {ip}")
-        except Exception as e:
-            results.append(f"❌ DNS解析失败 ({domain}): {e}")
-    else:
-        results.append("⚠️  LLM_BASE_URL未设置，跳过DNS解析测试")
-    
-    # 测试3：测试基础网络连通性
-    try:
-        response = requests.get("https://httpbin.org/ip", timeout=5)
-        results.append(f"✅ 基础网络正常: {response.status_code}")
-    except Exception as e:
-        results.append(f"❌ 基础网络异常: {e}")
-    
-    # 测试4：测试是否被防火墙阻挡
-    try:
-        # 尝试访问不同端口
-        response = requests.get("https://httpbin.org/headers", timeout=5)
-        results.append(f"✅ HTTP请求正常: {response.status_code}")
-    except Exception as e:
-        results.append(f"❌ HTTP请求失败: {e}")
-    
-    return "\n".join(results)
-
 # ==================== 2. 定义三个智能体的提示模板 ====================
 # 智能体1：拆解智能体 - 理解需求，拆解核心元素
 decompose_prompt = ChatPromptTemplate.from_template(
@@ -410,78 +359,6 @@ with gr.Blocks(title="SynthPoster", css=".scrollable-textbox textarea {overflow-
         inputs=[user_input],
         outputs=[output_decomposed, output_optimized, output_final, output_image]
     )
-    
-    # 添加测试部分
-    gr.Markdown("## 网络诊断工具")
-    test_btn = gr.Button("运行网络测试")
-    test_output = gr.Textbox(label="测试结果", lines=10)
-    test_btn.click(network_test, outputs=test_output)
-
-     # ==================== 新增：API连通性测试功能区 ====================
-    with gr.Accordion("🔧 API连通性测试（调试专用）", open=False):
-        gr.Markdown("""
-        **使用说明**：此功能将绕过LangChain，直接调用你配置的千问API。
-        1. 点击测试按钮。
-        2. 下方将显示：**你的配置**、**API原始响应**、**处理后的答案**。
-        3. 如果失败，会显示具体错误，请核对配置（特别是Base URL和模型名）。
-        """)
-        test_btn = gr.Button("🧪 测试API连接", variant="secondary")
-        test_output_config = gr.Textbox(label="你的API配置", lines=3, interactive=False)
-        test_output_raw = gr.Textbox(label="API原始响应", lines=5, interactive=False)
-        test_output_content = gr.Textbox(label="处理后的回答", lines=2, interactive=False)
-
-        # 定义测试函数
-        def test_api_connection():
-            config_info = f"""正在测试的配置：
-    API_KEY前5位: {LLM_API_KEY[:5] if LLM_API_KEY else 'None'}...
-    BASE_URL: {LLM_BASE_URL}
-    MODEL_NAME: {LLM_MODEL_NAME}
-    """
-            try:
-                # 1. 初始化openai客户端
-                client = openai.OpenAI(
-                    api_key=LLM_API_KEY,
-                    base_url=LLM_BASE_URL.rstrip('/')  # 移除末尾可能存在的斜杠
-                )
-                
-                # 2. 发送一个简单的测试请求
-                test_messages = [{"role": "user", "content": "请用中文简短回复：API连接测试成功。"}]
-                # 设置明确的超时时间，避免长时间挂起
-                response = client.chat.completions.create(
-                    model=LLM_MODEL_NAME,
-                    messages=test_messages,
-                    temperature=0.8,
-                    timeout=10.0  # 10秒超时
-                )
-                
-                # 3. 整理并返回结果
-                raw_response = f"响应对象类型: {type(response)}\n"
-                raw_response += f"是否收到响应: {hasattr(response, 'choices')}\n"
-                if hasattr(response, 'choices') and len(response.choices) > 0:
-                    raw_response += f"choices 结构: {response.choices[0]}"
-                
-                answer = response.choices[0].message.content
-                return config_info, raw_response, answer
-                
-            except openai.AuthenticationError as e:
-                error_detail = f"{config_info}\n\n❌ 认证失败 (可能原因):\n1. API_KEY 无效或已过期\n2. 未开通对应模型服务\n3. 服务区域不正确\n\n错误详情: {e}"
-                return error_detail, str(e), "认证失败"
-            except openai.NotFoundError as e:
-                error_detail = f"{config_info}\n\n❌ 未找到资源 (可能原因):\n1. MODEL_NAME '{LLM_MODEL_NAME}' 不正确\n2. BASE_URL 路径错误\n\n错误详情: {e}"
-                return error_detail, str(e), "模型或端点不存在"
-            except openai.APIConnectionError as e:
-                error_detail = f"{config_info}\n\n🌐 网络连接失败 (可能原因):\n1. BASE_URL 无法访问\n2. 网络代理问题\n3. Hugging Face Space 容器网络限制\n\n错误详情: {e}"
-                return error_detail, str(e), "网络连接失败"
-            except Exception as e:
-                error_detail = f"{config_info}\n\n⚠️ 未预期的错误:\n错误类型: {type(e).__name__}\n错误详情: {str(e)}"
-                return error_detail, str(e), f"调用失败: {type(e).__name__}"
-        
-        # 绑定测试按钮事件
-        test_btn.click(
-            fn=test_api_connection,
-            inputs=[],
-            outputs=[test_output_config, test_output_raw, test_output_content]
-        )
 
 # 运行
 if __name__ == "__main__":
