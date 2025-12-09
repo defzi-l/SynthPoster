@@ -7,12 +7,14 @@ from dotenv import load_dotenv
 import urllib.parse
 from urllib.parse import urlparse
 import requests
+from io import BytesIO
 import socket
 import openai
 import torch
-from diffusers import AutoPipelineForText2Image
 from typing import Optional
 from PIL import Image
+import dashscope
+from dashscope import ImageSynthesis
 
 # ==================== 1. 从环境变量加载设置 ====================
 load_dotenv() 
@@ -34,52 +36,15 @@ llm = ChatOpenAI(
     temperature=0.7,
 )
 
-# 选择适合CPU的模型，并在内存不足时进行优化
-IMAGE_MODEL_ID = "stabilityai/sd-turbo"  # 比SDXL-Turbo更轻量的模型
+dashscope.api_key = LLM_API_KEY
 
-# 动态加载图像生成管道，根据容器性能选择配置
-try:
-    # 尝试加载fp16精度的模型以节省内存，如果失败则降级为fp32
-    try:
-        image_pipe = AutoPipelineForText2Image.from_pretrained(
-            IMAGE_MODEL_ID,
-            torch_dtype=torch.float16,
-            safety_checker=None,  # 禁用安全检查器以加速并减少内存占用
-            use_safetensors=True
-        )
-    except (RuntimeError, OSError):
-        # 如果fp16失败，可能是内存不足或设备不支持，回退到fp32
-        print("fp16加载失败，尝试使用fp32精度加载模型...")
-        image_pipe = AutoPipelineForText2Image.from_pretrained(
-            IMAGE_MODEL_ID,
-            torch_dtype=torch.float32,
-            safety_checker=None,
-            use_safetensors=True
-        )
-    
-    # 将模型移至CPU（Hugging Face Space免费容器为CPU环境）
-    image_pipe = image_pipe.to("cpu")
-    
-    # 启用CPU优化，大幅减少内存使用并加速推理[citation:7][citation:8]
-    image_pipe.enable_attention_slicing()  # 注意力切片，降低峰值内存
-    if hasattr(image_pipe, "enable_cpu_offload"):
-        image_pipe.enable_cpu_offload()  # 如果管道支持CPU卸载，则启用
-    
-    print("✅ 图像生成模型加载成功 (运行在CPU模式)")
-    
-except Exception as e:
-    print(f"❌ 图像生成模型加载失败: {e}")
-    image_pipe = None
-
-# 定义图像生成函数
+# 定义图像生成函数 (增强错误处理版本)
 def generate_image_from_prompt(prompt: str) -> Optional[Image.Image]:
     """
-    使用加载的模型根据提示词生成图像。
+    使用通义千问 Qwen-Image API 生成图像，并实现异步轮询。
     返回PIL Image对象，如果生成失败则返回None。
     """
-    if image_pipe is None:
-        print("图像生成模型未加载，无法生成图片。")
-        return None
+    import time
     
     try:
         print(f"[Qwen-Image API] 提交任务，提示词: {prompt[:80]}...")
@@ -171,8 +136,11 @@ def generate_image_from_prompt(prompt: str) -> Optional[Image.Image]:
         # 循环结束，表示超时
         print(f"[Qwen-Image API] 错误：轮询超时（{max_wait_time}秒），任务可能仍在处理或已卡住。")
         return None
+
     except Exception as e:
-        print(f"❌ 图像生成过程出错: {e}")
+        print(f"[Qwen-Image API] 图像生成过程发生未预期错误: {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 def network_test():
@@ -346,7 +314,7 @@ def run_agent_chain(user_input: str):
         optimized_prompt = f"优化失败: {e}"
         return decomposed_text, optimized_prompt, ""
     
-    # 第三步：风格化
+    # 第三步：风格化 (升级为海报设计)
     try:
         print(f"[STEP 3] 调用海报设计师智能体...")
         # 直接将优化后的英文提示词传递给新的 review_prompt
@@ -359,7 +327,7 @@ def run_agent_chain(user_input: str):
         
     except Exception as e:
         print(f"[STEP 3] 失败: {e}")
-        final_prompt = f"风格化失败: {e}"
+        final_prompt = f"海报设计失败: {e}"
     
     return decomposed_text, optimized_prompt, final_prompt
 
@@ -385,11 +353,12 @@ def generate_poster(user_input):
     generated_image = None
     if final_image_prompt and not final_image_prompt.startswith("风格化失败"):
         # 仅当成功获得提示词时才尝试生成图像
+        print(f"[图像生成] 最终使用提示词 (长度{len(final_image_prompt.split())}词): {final_image_prompt[:60]}...")
         generated_image = generate_image_from_prompt(final_image_prompt)
     
     # 返回给Gradio显示
     # 注意：这里返回的是 decomposed_text, optimized_prompt, final_prompt_full
-    return decomposed_text, optimized_prompt, final_prompt_full, image_output
+    return decomposed_text, optimized_prompt, final_prompt_full, generated_image
 
 # ==================== 5. 构建并启动Gradio Web界面 ====================
 with gr.Blocks(title="SynthPoster", css=".scrollable-textbox textarea {overflow-y: auto !important;}") as demo:
