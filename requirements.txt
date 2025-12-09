@@ -5,7 +5,5 @@ langchain-openai>=0.0.8
 python-dotenv>=1.0.0
 openai>=1.10.0,<2.0.0
 requests>=2.25.1
-diffusers>=0.24.0
-transformers>=4.35.0
-accelerate>=0.24.0
 torch>=2.0.0
+dashscope
