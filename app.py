@@ -49,11 +49,27 @@ def generate_image_from_prompt(prompt: str) -> Optional[Image.Image]:
     try:
         print(f"[Qwen-Image API] 提交任务，提示词: {prompt[:80]}...")
 
+        # 根据提示词中的关键词动态设置尺寸
+        # Qwen-Image 支持的标准尺寸映射
+        size_map = {
+            'portrait': '928*1664',   # 9:16 竖版 (默认)
+            'square': '1328*1328',    # 1:1 方形
+            'landscape': '1664*928'   # 16:9 横版
+        }
+        # 检测提示词中的版式关键词
+        prompt_lower = prompt.lower()
+        chosen_size = size_map['portrait']  # 默认竖版
+        for key in size_map:
+            if key in prompt_lower:
+                chosen_size = size_map[key]
+                print(f"[尺寸映射] 检测到 '{key}'，使用尺寸: {chosen_size}")
+                break
+
         # 1. 提交异步生成任务
         resp = ImageSynthesis.async_call(
             model='qwen-image-plus',  # 或 'qwen-image'
             prompt=prompt,
-            size='1664*928',  # 16:9 横版，对应你的 `(Landscape poster)`
+            size=chosen_size, 
             n=1,
             prompt_extend=False
         )
@@ -211,45 +227,56 @@ optimize_prompt = ChatPromptTemplate.from_template(
 # 创建可运行链：prompt -> llm
 chain_optimize = optimize_prompt | llm
 
-# 智能体3：升级为“海报设计师”智能体 - 直接生成海报风格的提示词
+# ==================== 重构：智能体3 - 千问海报设计师智能体 ====================
+# 此智能体直接分析用户原始描述，生成专为Qwen-Image优化的中英混合海报提示词。
 review_prompt = ChatPromptTemplate.from_template(
     """
-    You are a professional graphic designer creating posters for campus events with AI.
+你是一名专业海报设计师，专门为通义千问AI文生图模型（Qwen-Image）设计生成提示词。
 
-    【Core Task】
-    Generate ONE concise, effective English prompt for an AI image model to create a complete poster based on the event description.
+【你的核心任务】
+根据用户对活动的原始中文描述，生成一段详细的、中英混合的AI图像生成提示词，以创建一张信息完整、视觉突出的**中文校园活动海报**。
 
-    【Input Analysis & Smart Decisions】
-    1.  **Size & Orientation (CRITICAL):** Analyze the following Chinese or English keywords in the description to decide the poster format. Integrate the chosen format like `(portrait poster)` or `(wide landscape poster)` into your final prompt.
-        - Keywords for **Portrait**: `竖版`, `竖向`, `portrait`, `vertical` -> Choose **portrait (9:16)**
-        - Keywords for **Square**: `方型`, `方形`, `正方形`, `square` -> Choose **square (1:1)**
-        - Keywords for **Landscape**: `横版`, `横向`, `landscape`, `wide` -> Choose **landscape (16:9)**
-        - **If no keywords are found, default to landscape (16:9).**
+【关键信息提取与结构化 (从用户输入中)】
+请严格按以下步骤分析用户输入：
+1.  **提取或生成标题**：如果描述中提供了活动标题（如“《模型协同》学术讲座”），直接提取。否则，基于活动主题生成一个简洁、有力的**中文主标题**（例如“AI融合创新论坛”）。
+2.  **提取或补全信息**：
+    - **时间**：必须提取或推断出具体的日期、开始和结束时间（如“2025年12月20日 下午3:00-5:00”）。如果只有“下午3点”，请补全为“下午3:00开始”。
+    - **地点**：提取具体地点（如“科学会堂101”）。如果未提供，则根据活动类型生成一个合理的**中文地点**（如“大学生活动中心”）。
+3.  **决定海报版式**：分析描述中的关键词，决定海报形状，并在你的提示词开头用英文注明：
+    - 如果包含 `竖版`、`竖向`、`portrait`、`vertical` -> 使用 `(Portrait poster, 9:16 ratio)`
+    - 如果包含 `方型`、`方形`、`square` -> 使用 `(Square poster, 1:1 ratio)`
+    - 如果包含 `横版`、`横向`、`landscape`、`wide` -> 使用 `(Landscape poster, 16:9 ratio)`
+    - **如果无关键词，默认使用 `(Portrait poster, 9:16 ratio)`**。
 
-    2.  **Layout & Content (STRUCTURED):** Your prompt must describe a poster with these clear sections:
-        - **MAIN HEADER:** A dominant, clear title area at the top. **If the description contains a title, use it. If not, invent a compelling, relevant title** (e.g., "Neural Nexus: AI Lecture Series" for an AI talk).
-        - **INFORMATION BLOCK:** A dedicated area with event details (time, date, venue). **If details are provided, use them. If not, fabricate plausible, specific details** (e.g., "Date: Apr 15 | Time: 6:00 PM | Location: University Hall 203").
-        - **CENTRAL VISUAL:** **One single, strong, symbolic icon/graphic** representing the event's core idea (e.g., interlocking gears for collaboration, a stylized brain for psychology). DO NOT describe a complex scene.
-        - **CLEAR TYPOGRAPHY ZONES:** Visually separate the header, info block, and background. Use phrases like "clear typography," "distinct text areas," "bold header."
+【构建你的提示词 (中英混合，结构清晰)】
+按照以下结构和语言规则构建最终提示词：
+1.  **海报版式与布局（英文）**：以第3步决定的版式英文描述开头，并描述布局：“Clear layout with distinct zones for title, information, and central visual.”
+    " The poster design fills the entire frame with no borders or margins, edge-to-edge composition."
+2.  **核心中文信息 - 文字精确性强化**：
+    - **标题区域**：描述“A large, bold header at the top featuring the Chinese text: 【这里放入第1步得到的中文标题】”。
+    - **信息区域**：描述“A clean information block below with the Chinese details: 【时间: 第2步得到的具体时间】|【地点: 第2步得到的具体地点】”。
+    *注意：必须用【】标注出要生成的确切中文文字。*
+    **文字生成规则**：
+    - **字形要求**：`Ensure every Chinese character is written correctly, with no missing or extra strokes, no typos, and clear legibility.`
+    - **字体风格**：`Use a clean, modern, and bold sans-serif font that is highly readable, similar to "Microsoft YaHei" or "PingFang SC". Avoid cursive or overly decorative fonts.`
+    - **布局强化**：`The text should be centered, with high contrast against the background (e.g., white text on dark background or black text on light background).`
+3.  **中央视觉与风格（英文）**：
+    - **核心图形**：基于活动主题，描述一个**象征性的、简单的图形**，如“Central visual of a stylized, interconnected network of nodes (representing model collaboration)”。
+    - **整体风格**：使用“Modern minimalist poster, flat vector illustration”。
+    - **色调**：根据活动类型选择，如学术类用“cool blue and gray color palette”。
+    - **随机艺术风格**：从以下列表中随机选择1-2种结合：`cyberpunk glow`, `retro vintage poster style`, `pop art, Roy Lichtenstein style`, `watercolor texture`, `pencil sketch`, `3D render, Blender`, `stained glass art`, `Chinese ink painting`, `low poly graphic`, `surrealism, Dali style`。
+4.  **质量与清晰度（英文）**：以“High contrast, clear typography, suitable for print. --ar 16:9 --q 2”结尾。（`--ar` 后的比例根据版式调整）
 
-    3.  **Style & Atmosphere (CREATIVE):**
-        - **Base Style:** "vector illustration", "flat design", "modern minimalist poster" – ensuring clarity for the AI model.
-        - **Color & Mood:** Choose a color palette fitting the event's nature (cool blues/grays for academic, warm vibrant colors for festivals/arts).
-        - **Random Artistic Flair (IMPORTANT):** **Randomly select and integrate ONE** of these styles to add uniqueness: `pop art`, `retro vintage`, `cyberpunk glow`, `watercolor splash`, `linocut print`.
+【最终输出规则】
+- **只输出**最终生成图像的完整提示词，**不要有任何额外解释**。
+- 提示词总长度控制在**100-120个英文单词**以内。
+- **严格遵循上述结构和语言混合要求**。
 
-    【Strict Output Rules】
-    - Output **ONLY the final image generation prompt**. No explanations, prefixes, or additional text.
-    - The prompt must be in **English**.
-    - **Strictly limit to 70 English words.** Be concise and powerful.
+【用户原始描述】
+{user_input}
 
-    【Example Prompt Structure】
-    "(Portrait poster) with a bold header 'AI Symposium 2024' and a lower info block stating 'Date: Nov 20 | Venue: Tech Center'. Central visual of a glowing, interconnected network nodes. Clean vector illustration, flat design with a cool blue and purple gradient, in a retro vintage style. Clear typography areas, minimalist layout."
-
-    【Event Description to Analyze】
-    {prompt}
-
-    【Your Output (ONLY the image prompt)】
-    """
+【你的输出 (仅提示词)】
+"""
 )
 # 创建可运行链：prompt -> llm
 chain_review = review_prompt | llm
@@ -292,7 +319,7 @@ def run_agent_chain(user_input: str):
         print(f"[STEP 3] 调用海报设计师智能体...")
         # 直接将优化后的英文提示词传递给新的 review_prompt
         # 新的 prompt 将自行从中文关键词中解析尺寸、并补全信息
-        step3_result = chain_review.invoke({"prompt": optimized_prompt}) # 注意变量名是 "prompt"
+        step3_result = chain_review.invoke({"user_input": user_input})
         final_prompt = step3_result.content.strip()
         
         word_count = len(final_prompt.split())
@@ -310,6 +337,15 @@ def generate_poster(user_input):
     # 调用我们上面定义的分步函数
     decomposed_text, optimized_prompt, final_prompt_full = run_agent_chain(user_input)
     
+    # **在图像生成前，进行严格的失败检测**
+    error_keywords = ["失败", "missing variables", "Error", "Exception", "Traceback"]
+    # 检查最终提示词是否包含任何错误关键词
+    if any(keyword in final_prompt_full for keyword in error_keywords):
+        # 如果检测到错误，立即停止，并返回错误信息，第四个返回值为None（无图片）
+        error_msg = f"流程错误，已终止图像生成以避免浪费Token。错误信息：{final_prompt_full[:150]}..."
+        print(f"[流程拦截] {error_msg}")
+        return decomposed_text, optimized_prompt, error_msg, None
+
     # 最终提示词
     final_image_prompt = final_prompt_full.strip()
     
@@ -325,12 +361,12 @@ def generate_poster(user_input):
     return decomposed_text, optimized_prompt, final_prompt_full, generated_image
 
 # ==================== 5. 构建并启动Gradio Web界面 ====================
-with gr.Blocks(title="SynthPoster") as demo:
+with gr.Blocks(title="SynthPoster", css=".scrollable-textbox textarea {overflow-y: auto !important;}") as demo:
     gr.Markdown("# 🎨 智汇海报 海报创作智能体协同系统")
     gr.Markdown("体验三个AI智能体如何协同工作：拆解 → 优化 → 风格化")
 
     with gr.Row():
-        with gr.Column():
+        with gr.Column(scale=2):
             user_input = gr.Textbox(
                 label="描述你想生成的海报",
                 placeholder="例如：AI模型协同讲座",
@@ -338,13 +374,35 @@ with gr.Blocks(title="SynthPoster") as demo:
             )
             btn = gr.Button("🚀 开始协同创作", variant="primary")
 
-        with gr.Column():
-            output_image = gr.Image(label="生成的海报", width=512)
+        with gr.Column(scale=1):
+            # 固定图片尺寸为竖版海报比例
+            output_image = gr.Image(
+                label="生成的海报",
+                width=360,        # 竖版宽度稍小
+                height=512,       # 竖版高度
+                scale=0           # 确保图片缩放适应区域
+            )
 
     with gr.Accordion("📝 点击查看智能体协同的完整过程", open=False):
-        output_decomposed = gr.Textbox(label="智能体1 - 创意拆解", lines=3)
-        output_optimized = gr.Textbox(label="智能体2 - 提示词优化", lines=3)
-        output_final = gr.Textbox(label="智能体3 - 风格定稿", lines=3)
+        # 为三个文本框添加滚动条
+        output_decomposed = gr.Textbox(
+            label="智能体1 - 创意拆解",
+            lines=3,
+            interactive=False,
+            elem_classes=["scrollable-textbox"]
+        )
+        output_optimized = gr.Textbox(
+            label="智能体2 - 提示词优化",
+            lines=3,
+            interactive=False,
+            elem_classes=["scrollable-textbox"]
+        )
+        output_final = gr.Textbox(
+            label="智能体3 - 风格定稿 (最终提示词)",
+            lines=3,
+            interactive=False,
+            elem_classes=["scrollable-textbox"]
+        )
 
     # 绑定按钮点击事件
     btn.click(
@@ -392,7 +450,7 @@ with gr.Blocks(title="SynthPoster") as demo:
                 response = client.chat.completions.create(
                     model=LLM_MODEL_NAME,
                     messages=test_messages,
-                    temperature=0.7,
+                    temperature=0.8,
                     timeout=10.0  # 10秒超时
                 )
                 
