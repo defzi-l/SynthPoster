@@ -82,24 +82,94 @@ def generate_image_from_prompt(prompt: str) -> Optional[Image.Image]:
         return None
     
     try:
-        print(f"正在生成图像，提示词: {prompt[:50]}...")
-        
-        # **关键参数调整**：为适应CPU环境，大幅减少生成步数以控制时间[citation:7]
-        # 标准SD-Turbo只需1-4步即可生成不错的效果
-        image = image_pipe(
+        print(f"[Qwen-Image API] 提交任务，提示词: {prompt[:80]}...")
+
+        # 根据提示词中的关键词动态设置尺寸
+        # Qwen-Image 支持的标准尺寸映射
+        size_map = {
+            'portrait': '928*1664',   # 9:16 竖版 (默认)
+            'square': '1328*1328',    # 1:1 方形
+            'landscape': '1664*928'   # 16:9 横版
+        }
+        # 检测提示词中的版式关键词
+        prompt_lower = prompt.lower()
+        chosen_size = size_map['portrait']  # 默认竖版
+        for key in size_map:
+            if key in prompt_lower:
+                chosen_size = size_map[key]
+                print(f"[尺寸映射] 检测到 '{key}'，使用尺寸: {chosen_size}")
+                break
+
+        # 1. 提交异步生成任务
+        resp = ImageSynthesis.async_call(
+            model='qwen-image-plus',  # 或 'qwen-image'
             prompt=prompt,
-            num_inference_steps=4,        # 步数：在CPU上建议1-4步
-            guidance_scale=1.0,           # 引导系数：SD-Turbo建议1.0（无分类器引导）
-            width=512,                    # 宽度：降低分辨率以大幅减少内存和计算量
-            height=512,                   # 高度
-            generator=torch.Generator(device="cpu").manual_seed(42)  # 固定种子使结果可复现
-        ).images[0]
-        
-        print("✅ 图像生成成功")
-        return image
-        
-    except torch.cuda.OutOfMemoryError:
-        print("❌ 内存溢出 (OOM)，即使是CPU环境也需注意内存限制。")
+            size=chosen_size, 
+            n=1,
+            prompt_extend=False
+        )
+
+        # 检查初始响应是否成功
+        if resp.status_code != 200 or not hasattr(resp, 'output') or not hasattr(resp.output, 'task_id'):
+            error_msg = getattr(resp, 'message', f'HTTP {resp.status_code}')
+            print(f"[Qwen-Image API] 任务提交失败: {error_msg}")
+            return None
+
+        task_id = resp.output.task_id
+        print(f"[Qwen-Image API] 任务提交成功，任务ID: {task_id}")
+
+        # 2. 轮询任务状态，直到完成、失败或超时
+        max_wait_time = 120  # 最大等待时间（秒），根据免费额度性能调整
+        poll_interval = 3    # 轮询间隔（秒）
+        start_time = time.time()
+
+        while time.time() - start_time < max_wait_time:
+            # 查询任务状态
+            status_resp = ImageSynthesis.fetch(task_id)
+            
+            if status_resp.status_code != 200:
+                print(f"[Qwen-Image API] 查询任务状态失败: {status_resp.status_code}")
+                break
+
+            task_status = status_resp.output.task_status
+            print(f"[Qwen-Image API] 轮询中... 任务状态: {task_status}")
+
+            if task_status == 'SUCCEEDED':
+                # 任务成功，获取结果
+                if hasattr(status_resp.output, 'results') and status_resp.output.results:
+                    image_url = status_resp.output.results[0].url
+                    print(f"[Qwen-Image API] 图像生成成功，开始下载...")
+                    # 下载图片
+                    image_response = requests.get(image_url, timeout=30)
+                    if image_response.status_code == 200:
+                        image = Image.open(BytesIO(image_response.content))
+                        print("✅ 图像下载并转换成功")
+                        return image
+                    else:
+                        print(f"[Qwen-Image API] 下载图片失败: {image_response.status_code}")
+                        return None
+                else:
+                    print("[Qwen-Image API] 任务成功但无结果。")
+                    return None
+                    
+            elif task_status == 'FAILED':
+                # 任务失败
+                error_msg = getattr(status_resp.output, 'message', '未知错误')
+                print(f"[Qwen-Image API] 任务执行失败: {error_msg}")
+                return None
+                
+            # 如果任务仍在运行或等待，则继续轮询
+            elif task_status in ['PENDING', 'RUNNING']:
+                time.sleep(poll_interval)
+                continue
+                
+            else:
+                # 遇到未知状态
+                print(f"[Qwen-Image API] 任务进入未知状态: {task_status}")
+                break
+
+        # 循环结束，表示超时
+        print(f"[Qwen-Image API] 错误：轮询超时（{max_wait_time}秒），任务可能仍在处理或已卡住。")
         return None
     except Exception as e:
         print(f"❌ 图像生成过程出错: {e}")
@@ -189,41 +259,56 @@ optimize_prompt = ChatPromptTemplate.from_template(
 # 创建可运行链：prompt -> llm
 chain_optimize = optimize_prompt | llm
 
-# 智能体3：审查/风格化智能体 - 为提示词添加统一风格
+# ==================== 重构：智能体3 - 千问海报设计师智能体 ====================
+# 此智能体直接分析用户原始描述，生成专为Qwen-Image优化的中英混合海报提示词。
 review_prompt = ChatPromptTemplate.from_template(
     """
-    你是一名专业的校园活动艺术总监。请根据用户对活动海报的描述，判断其活动类型，并为其优化和定型AI绘画提示词，使其符合该类校园海报的专业风格。
+你是一名专业海报设计师，专门为通义千问AI文生图模型（Qwen-Image）设计生成提示词。
 
-    请严格按以下步骤执行：
-    1. **判断活动类型**：根据描述，从以下常见类型中选择最匹配的，或推断一个合理的类型：
-       - **学术类**（如讲座、研讨会、竞赛）
-       - **招募类**（如社团招新、志愿者招募、队员招募）
-       - **文艺类**（如音乐会、话剧、舞蹈演出、画展）
-       - **庆典节日类**（如迎新晚会、毕业季、圣诞派对、校庆）
-       - **体育健身类**（如运动会、篮球赛、马拉松、瑜伽课）
-       - **宣传倡导类**（如环保倡议、公益宣传、心理健康周）
+【你的核心任务】
+根据用户对活动的原始中文描述，生成一段详细的、中英混合的AI图像生成提示词，以创建一张信息完整、视觉突出的**中文校园活动海报**。
 
-    2. **优化与定型**：
-       - 保持用户描述的**核心元素和原意**。
-       - 将语言优化得更富有**视觉冲击力、感染力和青春气息**，适合海报传播。
-       - 根据你判断的活动类型，在提示词末尾**自动添加最匹配的风格后缀**。
+【关键信息提取与结构化 (从用户输入中)】
+请严格按以下步骤分析用户输入：
+1.  **提取或生成标题**：如果描述中提供了活动标题（如“《模型协同》学术讲座”），直接提取。否则，基于活动主题生成一个简洁、有力的**中文主标题**（例如“AI融合创新论坛”）。
+2.  **提取或补全信息**：
+    - **时间**：必须提取或推断出具体的日期、开始和结束时间（如“2025年12月20日 下午3:00-5:00”）。如果只有“下午3点”，请补全为“下午3:00开始”。
+    - **地点**：提取具体地点（如“科学会堂101”）。如果未提供，则根据活动类型生成一个合理的**中文地点**（如“大学生活动中心”）。
+3.  **决定海报版式**：分析描述中的关键词，决定海报形状，并在你的提示词开头用英文注明：
+    - 如果包含 `竖版`、`竖向`、`portrait`、`vertical` -> 使用 `(Portrait poster, 9:16 ratio)`
+    - 如果包含 `方型`、`方形`、`square` -> 使用 `(Square poster, 1:1 ratio)`
+    - 如果包含 `横版`、`横向`、`landscape`、`wide` -> 使用 `(Landscape poster, 16:9 ratio)`
+    - **如果无关键词，默认使用 `(Portrait poster, 9:16 ratio)`**。
 
-    3. **添加风格后缀示例**
-       - 学术类：`, academic poster, clean layout, infographic style, vector illustration, vibrant, 4k`
-       - 招募类：`, recruitment poster, dynamic composition, bold typography, team spirit, flat design, vibrant colors`
-       - 文艺类：`, artistic poster, dramatic lighting, creative, painting style, trending on artstation, 8k`
-       - 庆典类：`, festive poster, joyful atmosphere, confetti, glowing lights, vector art, bright color palette`
-       - 体育类：`, sports poster, action shot, motion blur, energetic, strong contrast, graphic design`
-       - 宣传倡导类：`, public awareness poster, symbolic, minimalist, powerful message, solid background`
+【构建你的提示词 (中英混合，结构清晰)】
+按照以下结构和语言规则构建最终提示词：
+1.  **海报版式与布局（英文）**：以第3步决定的版式英文描述开头，并描述布局：“Clear layout with distinct zones for title, information, and central visual.”
+    " The poster design fills the entire frame with no borders or margins, edge-to-edge composition."
+2.  **核心中文信息 - 文字精确性强化**：
+    - **标题区域**：描述“A large, bold header at the top featuring the Chinese text: 【这里放入第1步得到的中文标题】”。
+    - **信息区域**：描述“A clean information block below with the Chinese details: 【时间: 第2步得到的具体时间】|【地点: 第2步得到的具体地点】”。
+    *注意：必须用【】标注出要生成的确切中文文字。*
+    **文字生成规则**：
+    - **字形要求**：`Ensure every Chinese character is written correctly, with no missing or extra strokes, no typos, and clear legibility.`
+    - **字体风格**：`Use a clean, modern, and bold sans-serif font that is highly readable, similar to "Microsoft YaHei" or "PingFang SC". Avoid cursive or overly decorative fonts.`
+    - **布局强化**：`The text should be centered, with high contrast against the background (e.g., white text on dark background or black text on light background).`
+3.  **中央视觉与风格（英文）**：
+    - **核心图形**：基于活动主题，描述一个**象征性的、简单的图形**，如“Central visual of a stylized, interconnected network of nodes (representing model collaboration)”。
+    - **整体风格**：使用“Modern minimalist poster, flat vector illustration”。
+    - **色调**：根据活动类型选择，如学术类用“cool blue and gray color palette”。
+    - **随机艺术风格**：从以下列表中随机选择1-2种结合：`cyberpunk glow`, `retro vintage poster style`, `pop art, Roy Lichtenstein style`, `watercolor texture`, `pencil sketch`, `3D render, Blender`, `stained glass art`, `Chinese ink painting`, `low poly graphic`, `surrealism, Dali style`。
+4.  **质量与清晰度（英文）**：以“High contrast, clear typography, suitable for print. --ar 16:9 --q 2”结尾。（`--ar` 后的比例根据版式调整）
 
-    【用户描述】
-    {prompt}
+【最终输出规则】
+- **只输出**最终生成图像的完整提示词，**不要有任何额外解释**。
+- 提示词总长度控制在**100-120个英文单词**以内。
+- **严格遵循上述结构和语言混合要求**。
 
-    【你的输出】
-    请直接输出以下两部分内容，用"---"分隔：
-    第一部分：仅一句话说明"判断为：【类型】类活动海报"。
-    第二部分：直接给出优化并添加了对应风格后缀的完整英文提示词。
-    """
+【用户原始描述】
+{user_input}
+
+【你的输出 (仅提示词)】
+"""
 )
 # 创建可运行链：prompt -> llm
 chain_review = review_prompt | llm
@@ -263,11 +348,15 @@ def run_agent_chain(user_input: str):
     
     # 第三步：风格化
     try:
-        print(f"[STEP 3] 调用 chain_review...")
-        # 明确使用上一步的结果作为输入
-        step3_result = chain_review.invoke({"prompt": optimized_prompt})
-        final_prompt = step3_result.content
-        print(f"[STEP 3] 成功。结果: {final_prompt[:100]}...")
+        print(f"[STEP 3] 调用海报设计师智能体...")
+        # 直接将优化后的英文提示词传递给新的 review_prompt
+        # 新的 prompt 将自行从中文关键词中解析尺寸、并补全信息
+        step3_result = chain_review.invoke({"user_input": user_input})
+        final_prompt = step3_result.content.strip()
+        
+        word_count = len(final_prompt.split())
+        print(f"[STEP 3] 海报提示词生成成功 (单词数: {word_count})。内容预览: {final_prompt[:80]}...")
+        
     except Exception as e:
         print(f"[STEP 3] 失败: {e}")
         final_prompt = f"风格化失败: {e}"
@@ -280,13 +369,17 @@ def generate_poster(user_input):
     # 调用我们上面定义的分步函数
     decomposed_text, optimized_prompt, final_prompt_full = run_agent_chain(user_input)
     
-    # 拆分最终提示词
-    if "---" in final_prompt_full:
-        type_part, final_prompt_part = final_prompt_full.split("---", 1)
-        final_image_prompt = final_prompt_part.strip()
-    else:
-        type_part, final_prompt_part = "类型判断未明确", final_prompt_full
-        final_image_prompt = final_prompt_part.strip()
+    # **在图像生成前，进行严格的失败检测**
+    error_keywords = ["失败", "missing variables", "Error", "Exception", "Traceback"]
+    # 检查最终提示词是否包含任何错误关键词
+    if any(keyword in final_prompt_full for keyword in error_keywords):
+        # 如果检测到错误，立即停止，并返回错误信息，第四个返回值为None（无图片）
+        error_msg = f"流程错误，已终止图像生成以避免浪费Token。错误信息：{final_prompt_full[:150]}..."
+        print(f"[流程拦截] {error_msg}")
+        return decomposed_text, optimized_prompt, error_msg, None
+
+    # 最终提示词
+    final_image_prompt = final_prompt_full.strip()
     
     # 图像部分暂时为空
     generated_image = None
@@ -299,12 +392,12 @@ def generate_poster(user_input):
     return decomposed_text, optimized_prompt, final_prompt_full, image_output
 
 # ==================== 5. 构建并启动Gradio Web界面 ====================
-with gr.Blocks(title="SynthPoster") as demo:
+with gr.Blocks(title="SynthPoster", css=".scrollable-textbox textarea {overflow-y: auto !important;}") as demo:
     gr.Markdown("# 🎨 智汇海报 海报创作智能体协同系统")
     gr.Markdown("体验三个AI智能体如何协同工作：拆解 → 优化 → 风格化")
 
     with gr.Row():
-        with gr.Column():
+        with gr.Column(scale=2):
             user_input = gr.Textbox(
                 label="描述你想生成的海报",
                 placeholder="例如：AI模型协同讲座",
@@ -312,13 +405,35 @@ with gr.Blocks(title="SynthPoster") as demo:
             )
             btn = gr.Button("🚀 开始协同创作", variant="primary")
 
-        with gr.Column():
-            output_image = gr.Image(label="生成的海报", width=512)
+        with gr.Column(scale=1):
+            # 固定图片尺寸为竖版海报比例
+            output_image = gr.Image(
+                label="生成的海报",
+                width=360,        # 竖版宽度稍小
+                height=512,       # 竖版高度
+                scale=0           # 确保图片缩放适应区域
+            )
 
     with gr.Accordion("📝 点击查看智能体协同的完整过程", open=False):
-        output_decomposed = gr.Textbox(label="智能体1 - 创意拆解", lines=3)
-        output_optimized = gr.Textbox(label="智能体2 - 提示词优化", lines=3)
-        output_final = gr.Textbox(label="智能体3 - 风格定稿", lines=3)
+        # 为三个文本框添加滚动条
+        output_decomposed = gr.Textbox(
+            label="智能体1 - 创意拆解",
+            lines=3,
+            interactive=False,
+            elem_classes=["scrollable-textbox"]
+        )
+        output_optimized = gr.Textbox(
+            label="智能体2 - 提示词优化",
+            lines=3,
+            interactive=False,
+            elem_classes=["scrollable-textbox"]
+        )
+        output_final = gr.Textbox(
+            label="智能体3 - 风格定稿 (最终提示词)",
+            lines=3,
+            interactive=False,
+            elem_classes=["scrollable-textbox"]
+        )
 
     # 绑定按钮点击事件
     btn.click(
@@ -366,7 +481,7 @@ with gr.Blocks(title="SynthPoster") as demo:
                 response = client.chat.completions.create(
                     model=LLM_MODEL_NAME,
                     messages=test_messages,
-                    temperature=0.7,
+                    temperature=0.8,
                     timeout=10.0  # 10秒超时
                 )
                 
